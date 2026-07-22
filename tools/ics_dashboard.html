@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ICS PID Monitor</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #18202a; background: #f4f6f8; }
+    header { min-height: 56px; display: flex; align-items: center; gap: 18px; padding: 10px 22px; background: #fff; border-bottom: 1px solid #ccd2d8; }
+    h1 { margin: 0; font-size: 18px; font-weight: 650; }
+    #status { margin-left: auto; text-align: right; font: 12px Consolas, monospace; color: #4b5966; overflow-wrap: anywhere; }
+    main { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 56px); }
+    aside { padding: 18px; background: #fff; border-right: 1px solid #ccd2d8; }
+    .tabs { display: grid; grid-template-columns: repeat(4, 1fr); margin-bottom: 20px; border: 1px solid #aeb7c0; border-radius: 6px; overflow: hidden; }
+    .tabs button { border: 0; border-right: 1px solid #aeb7c0; padding: 9px 4px; background: #fff; cursor: pointer; }
+    .tabs button:last-child { border-right: 0; }
+    .tabs button.active { background: #263746; color: #fff; }
+    .control { margin-bottom: 18px; }
+    .control label { display: flex; justify-content: space-between; margin-bottom: 7px; font-size: 13px; font-weight: 600; }
+    .control output { font: 12px Consolas, monospace; color: #52606c; }
+    input[type=range] { width: 100%; accent-color: #167d75; }
+    .readouts { display: grid; gap: 8px; margin-top: 24px; }
+    .readout { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e0e4e8; font-size: 13px; }
+    .readout span:last-child { font-family: Consolas, monospace; }
+    section { min-width: 0; padding: 18px 22px 24px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 12px; font-size: 13px; }
+    .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 6px; background: var(--c); }
+    .plot { height: calc(100vh - 176px); min-height: 380px; background: #fff; border: 1px solid #ccd2d8; border-radius: 6px; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .timeline { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 10px; margin-top: 12px; }
+    .timeline button, .timeline select { height: 32px; border: 1px solid #aeb7c0; border-radius: 5px; background: #fff; color: #18202a; }
+    .timeline button { padding: 0 14px; cursor: pointer; }
+    .timeline button.active { background: #263746; color: #fff; border-color: #263746; }
+    .timeline select { padding: 0 8px; }
+    #timeLabel { min-width: 92px; text-align: right; font: 12px Consolas, monospace; color: #52606c; }
+    @media (max-width: 760px) { header { flex-wrap: wrap; } #status { flex-basis: 100%; margin-left: 0; text-align: left; } main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #ccd2d8; } .plot { height: 52vh; min-height: 340px; } }
+  </style>
+</head>
+<body>
+  <header><h1>ICS PID Monitor</h1><div id="loopTitle">Roll loop</div><div id="status">waiting for telemetry</div></header>
+  <main>
+    <aside>
+      <div class="tabs">
+        <button data-loop="roll" class="active">Roll</button>
+        <button data-loop="pitch">Pitch</button>
+        <button data-loop="flare">Flare</button>
+        <button data-loop="speed">Speed</button>
+      </div>
+      <div id="controls"></div>
+      <div class="readouts">
+        <div class="readout"><span>Value</span><span id="value">--</span></div>
+        <div class="readout"><span>Setpoint</span><span id="setpoint">--</span></div>
+        <div class="readout"><span>Output</span><span id="output">--</span></div>
+        <div class="readout"><span>I term</span><span id="integral">--</span></div>
+      </div>
+    </aside>
+    <section>
+      <div class="legend">
+        <span style="--c:#c73535">Value</span><span style="--c:#5535b5">Setpoint</span>
+        <span style="--c:#168e7a">Output</span><span style="--c:#b49b13">Integral</span>
+      </div>
+      <div class="plot"><canvas id="chart"></canvas></div>
+      <div class="timeline">
+        <button id="live" class="active">Live</button>
+        <input id="timeline" type="range" min="0" max="0" step="0.1" value="0" aria-label="Run timeline">
+        <span id="timeLabel">00:00 / 00:00</span>
+        <select id="window" aria-label="Visible time window">
+          <option value="30">30 sec</option><option value="60">60 sec</option>
+          <option value="120">120 sec</option><option value="all">Full run</option>
+        </select>
+      </div>
+    </section>
+  </main>
+  <script>
+    const colors = {value:'#c73535', setpoint:'#5535b5', output:'#168e7a', integral:'#b49b13'};
+    const ranges = {
+      roll: {kp:[-10,0,0.025], ki:[-0.5,0.5,0.001], kd:[-1,0.5,0.005]},
+      pitch:{kp:[0,0.2,0.0025], ki:[0,0.02,0.0005], kd:[0,0.2,0.0025]},
+      flare:{kp:[0,0.2,0.0025], ki:[0,0.02,0.0005], kd:[0,0.2,0.0025]},
+      speed:{kp:[0,0.02,0.00025], ki:[0,0.005,0.00005], kd:[0,0.02,0.00025]}
+    };
+    const loopTitles = {roll:'Roll loop', pitch:'Pitch loop', flare:'Flare view', speed:'Speed loop'};
+    let activeLoop = 'roll', points = [], gains = {}, lastSequence = -1, runId = null, atLive = true;
+    const canvas = document.querySelector('#chart'), ctx = canvas.getContext('2d');
+    const timeline = document.querySelector('#timeline'), liveButton = document.querySelector('#live');
+    document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+      activeLoop = b.dataset.loop;
+      document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('active', x === b));
+      document.querySelector('#loopTitle').textContent = loopTitles[activeLoop];
+      buildControls(); draw();
+    });
+    timeline.oninput = () => { atLive = false; liveButton.classList.remove('active'); draw(); };
+    liveButton.onclick = () => {
+      atLive = true; liveButton.classList.add('active');
+      if (points.length) timeline.value = points.at(-1).t;
+      draw();
+    };
+    document.querySelector('#window').onchange = draw;
+    function buildControls() {
+      const root = document.querySelector('#controls'); root.innerHTML = '';
+      for (const key of ['kp','ki','kd']) {
+        const [min,max,step] = ranges[activeLoop][key], value = gains[activeLoop]?.[key] ?? 0;
+        const box = document.createElement('div'); box.className = 'control';
+        box.innerHTML = `<label><span>${key.toUpperCase()}</span><output>${Number(value).toFixed(5)}</output></label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}">`;
+        const input = box.querySelector('input'), output = box.querySelector('output');
+        input.oninput = () => output.textContent = Number(input.value).toFixed(5);
+        input.onchange = async () => {
+          const payload = {loop:activeLoop}; payload[key] = Number(input.value);
+          await fetch('/api/gains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+        };
+        root.appendChild(box);
+      }
+    }
+    async function refresh() {
+      try {
+        const data = await (await fetch(`/api/state?since=${lastSequence}`,{cache:'no-store'})).json();
+        if (runId !== null && runId !== data.run_id) {
+          points = []; lastSequence = -1; atLive = true; liveButton.classList.add('active');
+        }
+        runId = data.run_id;
+        if (data.points.length) points.push(...data.points);
+        lastSequence = data.last_sequence;
+        const firstLoad = !Object.keys(gains).length; gains = data.gains;
+        if (firstLoad) buildControls();
+        const latest = points.at(-1);
+        if (latest) {
+          timeline.min = points[0].t; timeline.max = latest.t;
+          if (atLive) timeline.value = latest.t;
+          const phase = latest.meta.flare ? 'FLARE' : latest.meta.flaps;
+          const envelope = latest.meta.warnings.length ? `WARN ${latest.meta.warnings.join(',')}` : 'ENV OK';
+          document.querySelector('#status').textContent = `${phase} ${envelope} | RA ${latest.meta.ra.toFixed(0)} | IAS->${latest.meta.vapp.toFixed(0)} | VS ${latest.meta.vs.toFixed(0)} | flare ${latest.meta.flare_progress.toFixed(2)} | M ${latest.meta.mach.toFixed(3)} | AoA ${latest.meta.aoa.toFixed(2)}/${latest.meta.aoa_ref.toFixed(2)} deg | THR ${latest.meta.throttle_left.toFixed(1)}/${latest.meta.throttle_right.toFixed(1)} deg -> ${latest.meta.throttle_cmd.toFixed(3)} | rudder ${latest.meta.rudder_cmd.toFixed(2)} deg | T ${latest.meta.thrust_left.toFixed(0)}/${latest.meta.thrust_right.toFixed(0)} | LOC ${latest.meta.loc.toFixed(3)} | GS ${latest.meta.gs.toFixed(3)}`;
+        }
+        draw();
+      } catch { document.querySelector('#status').textContent = 'dashboard disconnected'; }
+      finally { setTimeout(refresh,500); }
+    }
+    function draw() {
+      const rect = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width*dpr); canvas.height = Math.round(rect.height*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
+      const w=rect.width,h=rect.height,pad={l:56,r:18,t:18,b:34}; ctx.clearRect(0,0,w,h);
+      if (!points.length) return;
+      const runStart=points[0].t, runEnd=points.at(-1).t;
+      const end=atLive ? runEnd : Number(timeline.value);
+      const selected=points.reduce((best,p) => Math.abs(p.t-end)<Math.abs(best.t-end) ? p : best, points[0]);
+      const value=selected[activeLoop];
+      for(const key of ['value','setpoint','output','integral']) document.querySelector('#'+key).textContent=Number(value[key]).toFixed(3);
+      const windowValue=document.querySelector('#window').value;
+      const start=windowValue==='all' ? runStart : Math.max(runStart,end-Number(windowValue));
+      const visible=points.filter(p => p.t>=start && p.t<=end), vals=[];
+      document.querySelector('#timeLabel').textContent=`${formatTime(end)} / ${formatTime(runEnd)}`;
+      visible.forEach(p => Object.values(p[activeLoop]).forEach(v => Number.isFinite(v)&&vals.push(v)));
+      if (!visible.length) return;
+      let lo=Math.min(...vals), hi=Math.max(...vals); if (hi-lo<1) {lo-=0.5;hi+=0.5;} const margin=(hi-lo)*0.1;lo-=margin;hi+=margin;
+      ctx.font='12px Segoe UI';ctx.strokeStyle='#d8dde2';ctx.fillStyle='#52606c';ctx.lineWidth=1;
+      for(let i=0;i<=5;i++){const y=pad.t+(h-pad.t-pad.b)*i/5;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();const v=hi-(hi-lo)*i/5;ctx.fillText(v.toFixed(2),6,y+4);}
+      const t0=visible[0].t,t1=visible.at(-1).t,span=Math.max(t1-t0,1);
+      for(const key of ['value','setpoint','output','integral']){ctx.beginPath();ctx.strokeStyle=colors[key];ctx.lineWidth=2;visible.forEach((p,i)=>{const x=pad.l+(w-pad.l-pad.r)*(p.t-t0)/span,y=pad.t+(h-pad.t-pad.b)*(hi-p[activeLoop][key])/(hi-lo);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}
+      ctx.fillStyle='#52606c';ctx.fillText(t0.toFixed(1)+'s',pad.l,h-10);ctx.fillText(t1.toFixed(1)+'s',w-pad.r-34,h-10);
+    }
+    function formatTime(seconds) {
+      const whole=Math.max(0,Math.round(seconds));
+      return `${String(Math.floor(whole/60)).padStart(2,'0')}:${String(whole%60).padStart(2,'0')}`;
+    }
+    addEventListener('resize',draw); refresh();
+  </script>
+</body>
+</html>
