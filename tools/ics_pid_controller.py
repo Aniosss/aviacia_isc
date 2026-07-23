@@ -261,14 +261,15 @@ class ClearWeatherILSController:
         speed_of_sound_kt = 38.967854 * math.sqrt(static_temperature_k)
         mach = (
             state.TrueAirspeed / speed_of_sound_kt
-            if state.TrueAirspeedValid and state.TrueAirspeed > 0.0
+            if math.isfinite(state.TrueAirspeed) and state.TrueAirspeed > 0.0
             else 0.32
         )
         limits = approach_limits(cfg.landing_weight_kg, flap_configuration, mach)
         if self._target_ias_kt is None:
             self._target_ias_kt = (
                 state.IndicatedAirspeed
-                if state.IndicatedAirspeedValid and state.IndicatedAirspeed > 0.0
+                if math.isfinite(state.IndicatedAirspeed)
+                and state.IndicatedAirspeed > 0.0
                 else limits.vapp_kt
             )
         speed_target_step = cfg.target_ias_rate_kt_per_s * clamp(dt_s, 0.001, 0.25)
@@ -286,8 +287,12 @@ class ClearWeatherILSController:
             -cfg.max_intercept_angle_deg,
             cfg.max_intercept_angle_deg,
         )
+        # The localizer defines a desired ground track, not a desired aircraft
+        # heading.  Comparing against magnetic heading makes the intercept
+        # command disappear into the crab angle in a crosswind and leaves a
+        # steady lateral offset from the runway centerline.
         target_heading = (state.RunwayHeading + intercept) % 360.0
-        heading_error = angle_error_deg(target_heading, state.MagneticHeading)
+        heading_error = angle_error_deg(target_heading, state.TrkAngleMagnetic)
         active_roll_limit = roll_limit_deg(state.RadioAltitude, cfg.max_roll_target_deg)
         target_roll = clamp(
             cfg.heading_to_roll_gain * heading_error,
@@ -363,10 +368,15 @@ class ClearWeatherILSController:
         target_flight_path_angle = math.degrees(math.atan2(target_vs, groundspeed_fpm))
         estimated_aoa = state.PitchAngle - flight_path_angle
         vertical_speed_error = target_vs - state.VerticalSpeed
-        aoa_measurement_valid = bool(
-            state.PitchAngleValid and state.VerticalSpeedValid and state.GroundSpeedValid
+        aoa_measurement_usable = all(
+            math.isfinite(value)
+            for value in (
+                state.PitchAngle,
+                state.VerticalSpeed,
+                state.GroundSpeed,
+            )
         )
-        if cfg.adaptive_aoa_enabled and aoa_measurement_valid:
+        if cfg.adaptive_aoa_enabled and aoa_measurement_usable:
             measured_reference_aoa = clamp(
                 estimated_aoa,
                 cfg.adaptive_aoa_min_deg,
@@ -434,7 +444,11 @@ class ClearWeatherILSController:
             # approach AoA law, roundout follows vertical-speed error directly
             # and damps both attitude and pitch rate.
             vertical_correction = cfg.flare_vs_to_pitch_gain_deg_per_fpm * vertical_speed_error
-            pitch_rate = state.BodyPitchRate if state.BodyPitchRateValid else 0.0
+            pitch_rate = (
+                state.BodyPitchRate
+                if math.isfinite(state.BodyPitchRate)
+                else 0.0
+            )
             raw_target_pitch = clamp(
                 cfg.flare_pitch_base_deg
                 + vertical_correction
@@ -551,7 +565,7 @@ class ClearWeatherILSController:
         if abs(state.RollAngle) > active_roll_limit:
             warnings.append("ROLL_LIMIT")
         # IRS body-normal acceleration is unbiased: zero corresponds to steady 1 g.
-        if state.BodyNormAccelValid and abs(state.BodyNormAccel) > 1.0:
+        if math.isfinite(state.BodyNormAccel) and abs(state.BodyNormAccel) > 1.0:
             warnings.append("LOAD_FACTOR")
         if flare_active:
             if state.IndicatedAirspeed <= limits.touchdown_speed_min_kt:

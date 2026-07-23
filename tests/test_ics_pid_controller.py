@@ -44,6 +44,7 @@ def make_state(**overrides: object) -> ICSInputs:
         "FlapsAngle": 36.0,
         "RunwayHeading": 64.0,
         "MagneticHeading": 64.0,
+        "TrkAngleMagnetic": 64.0,
         "PitchAngle": 2.5,
         "PitchAngleValid": 1,
     })
@@ -67,6 +68,35 @@ class PIDTests(unittest.TestCase):
         result = controller.update(make_state(LocDeviation=-0.155), 0.05)
         self.assertLess(result.target_roll_deg, 0.0)
         self.assertGreater(result.aileron, 0.0)
+
+    def test_crosswind_crab_does_not_consume_localizer_intercept(self) -> None:
+        controller = ClearWeatherILSController(ControllerConfig())
+        result = controller.update(
+            make_state(
+                LocDeviation=-0.06975,
+                MagneticHeading=59.5,
+                TrkAngleMagnetic=63.4,
+            ),
+            0.05,
+        )
+
+        self.assertAlmostEqual(result.target_heading_deg, 59.5)
+        self.assertAlmostEqual(result.heading_error_deg, -3.9)
+        self.assertAlmostEqual(result.target_roll_deg, -2.73)
+
+    def test_centered_localizer_holds_runway_track_while_crabbed(self) -> None:
+        controller = ClearWeatherILSController(ControllerConfig())
+        result = controller.update(
+            make_state(
+                LocDeviation=0.0,
+                MagneticHeading=60.0,
+                TrkAngleMagnetic=64.0,
+            ),
+            0.05,
+        )
+
+        self.assertAlmostEqual(result.heading_error_deg, 0.0)
+        self.assertAlmostEqual(result.target_roll_deg, 0.0)
 
     def test_outputs_respect_limits(self) -> None:
         config = ControllerConfig()
@@ -378,6 +408,48 @@ class PIDTests(unittest.TestCase):
         self.assertAlmostEqual(result.mach, 0.313, places=3)
         self.assertAlmostEqual(result.alpha_prot_deg, 12.818, places=3)
 
+    def test_numeric_true_airspeed_is_used_when_valid_flag_is_zero(self) -> None:
+        controller = ClearWeatherILSController(ControllerConfig())
+
+        result = controller.update(
+            make_state(TrueAirspeedValid=0, TrueAirspeed=207.0, AirfieldTemp=15.0),
+            0.05,
+        )
+
+        self.assertAlmostEqual(result.mach, 0.313, places=3)
+
+    def test_adaptive_aoa_uses_numeric_values_when_valid_flags_are_zero(self) -> None:
+        config = ControllerConfig(
+            adaptive_aoa_filter_tau_s=0.0,
+            adaptive_aoa_rate_deg_per_s=10.0,
+        )
+        controller = ClearWeatherILSController(config)
+        invalid_flags = {
+            "PitchAngleValid": 0,
+            "VerticalSpeedValid": 0,
+            "GroundSpeedValid": 0,
+        }
+        initial = controller.update(
+            make_state(
+                PitchAngle=9.0,
+                VerticalSpeed=0.0,
+                GroundSpeed=140.0,
+                **invalid_flags,
+            ),
+            0.1,
+        )
+        updated = controller.update(
+            make_state(
+                PitchAngle=5.0,
+                VerticalSpeed=-700.0,
+                GroundSpeed=140.0,
+                **invalid_flags,
+            ),
+            0.1,
+        )
+
+        self.assertLess(updated.reference_aoa_deg, initial.reference_aoa_deg)
+
     def test_flare_linearly_blends_upstream_initial_vs_to_touchdown_rate(self) -> None:
         config = ControllerConfig()
         controller = ClearWeatherILSController(config)
@@ -422,6 +494,28 @@ class PIDTests(unittest.TestCase):
             VerticalSpeed=-800.0,
             PitchAngle=2.0,
             BodyPitchRateValid=1,
+            BodyPitchRate=1.0,
+        )
+
+        result = controller.update(state, 0.1)
+
+        expected = (
+            config.flare_pitch_base_deg
+            + config.flare_vs_to_pitch_gain_deg_per_fpm
+            * (config.flare_initial_vs_fpm - state.VerticalSpeed)
+            - config.flare_pitch_attitude_damping_gain * state.PitchAngle
+            - config.flare_pitch_rate_damping_gain * state.BodyPitchRate
+        )
+        self.assertAlmostEqual(result.target_pitch_deg, expected)
+
+    def test_flare_uses_numeric_pitch_rate_when_valid_flag_is_zero(self) -> None:
+        config = ControllerConfig(flare_pitch_target_rate_deg_per_s=100.0)
+        controller = ClearWeatherILSController(config)
+        state = make_state(
+            RadioAltitude=150.0,
+            VerticalSpeed=-800.0,
+            PitchAngle=2.0,
+            BodyPitchRateValid=0,
             BodyPitchRate=1.0,
         )
 
@@ -723,6 +817,16 @@ class PIDTests(unittest.TestCase):
         )
 
         self.assertNotIn("LOAD_FACTOR", result.envelope_warnings)
+
+    def test_numeric_normal_acceleration_is_used_when_valid_flag_is_zero(self) -> None:
+        controller = ClearWeatherILSController(ControllerConfig())
+
+        result = controller.update(
+            make_state(BodyNormAccelValid=0, BodyNormAccel=2.2),
+            0.05,
+        )
+
+        self.assertIn("LOAD_FACTOR", result.envelope_warnings)
 
 if __name__ == "__main__":
     unittest.main()

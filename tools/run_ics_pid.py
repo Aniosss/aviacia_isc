@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import socket
 import time
 from pathlib import Path
 
+from ics_approach_criteria import ApproachCriteriaConfig, ApproachCriteriaMonitor
 from ics_dashboard import DashboardServer, DashboardState
 from ics_flight_envelope import LandingFlapConfiguration, measured_landing_flaps
 from ics_pid_controller import ClearWeatherILSController, ControllerConfig, ControlResult
@@ -96,6 +98,17 @@ def main() -> int:
         help="Required landing configuration; overrides landing_flap_fallback from the config.",
     )
     parser.add_argument("--dashboard", action="store_true", help="Open the live PID dashboard server.")
+    parser.add_argument(
+        "--check-a11-criteria",
+        action="store_true",
+        help=(
+            "Evaluate the A.1.1 course/glideslope limits above the radio-altitude "
+            "cutoff and stop commands when the cutoff is reached."
+        ),
+    )
+    parser.add_argument("--criteria-cutoff-ra-ft", type=float, default=300.0)
+    parser.add_argument("--criteria-max-course-error-deg", type=float, default=0.7)
+    parser.add_argument("--criteria-max-glideslope-error-deg", type=float, default=0.5)
     parser.add_argument("--dashboard-host", default="127.0.0.1")
     parser.add_argument("--dashboard-port", type=int, default=8765)
     parser.add_argument(
@@ -110,8 +123,19 @@ def main() -> int:
         or args.rate_hz <= 0.0
         or args.console_rate_hz <= 0.0
         or args.dashboard_hold_seconds < 0.0
+        or args.criteria_cutoff_ra_ft <= 0.0
+        or args.criteria_max_course_error_deg <= 0.0
+        or args.criteria_max_glideslope_error_deg <= 0.0
+        or not all(
+            math.isfinite(value)
+            for value in (
+                args.criteria_cutoff_ra_ft,
+                args.criteria_max_course_error_deg,
+                args.criteria_max_glideslope_error_deg,
+            )
+        )
     ):
-        parser.error("duration and rates must be positive")
+        parser.error("duration, rates, cutoff, and criteria limits must be positive")
 
     config = ControllerConfig.from_json(args.config)
     if args.landing_flaps is not None:
@@ -121,6 +145,22 @@ def main() -> int:
             parser.error("landing weight must be positive")
         config.landing_weight_kg = args.landing_weight_kg
     controller = ClearWeatherILSController(config)
+    criteria_monitor = None
+    if args.check_a11_criteria:
+        criteria_monitor = ApproachCriteriaMonitor(
+            ApproachCriteriaConfig(
+                cutoff_radio_altitude_ft=args.criteria_cutoff_ra_ft,
+                max_course_error_deg=args.criteria_max_course_error_deg,
+                max_glideslope_error_deg=args.criteria_max_glideslope_error_deg,
+                target_glideslope_deg=config.glideslope_angle_deg,
+            )
+        )
+        print(
+            "A.1.1 criteria enabled: "
+            f"cutoff={args.criteria_cutoff_ra_ft:g}ft "
+            f"course<={args.criteria_max_course_error_deg:g}deg "
+            f"glideslope<={args.criteria_max_glideslope_error_deg:g}deg"
+        )
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.bind_ip, args.bind_port))
@@ -213,6 +253,7 @@ def main() -> int:
         "roll_kp", "roll_ki", "roll_kd", "roll_i_term",
         "pitch_kp", "pitch_ki", "pitch_kd", "pitch_i_term",
         "speed_kp", "speed_ki", "speed_kd", "speed_i_term",
+        "criteria_course_error_deg", "criteria_glideslope_error_deg", "criteria_status",
     )
     start = time.monotonic()
     previous = start
@@ -264,18 +305,25 @@ def main() -> int:
                         f"{state.RightGearWeightOnWheels}; continuing to touchdown"
                     )
                     terminal_inactive_reported = True
-                if args.send and not touchdown_detected and not terminal_phase and (
-                    state.LocDeviationValid == 0 or state.GSDeviationValid == 0
-                ):
-                    print("ILS guidance became invalid; deactivating")
-                    exit_code = 7
-                    break
                 dt_s = now - previous
                 previous = now
                 result = controller.update(state, dt_s)
                 if dashboard_state is not None:
                     dashboard_state.record(now - start, state, result)
-                if args.send and not touchdown_detected and now >= next_send:
+                criteria_sample = None
+                criteria_cutoff_reached = False
+                if criteria_monitor is not None:
+                    criteria_sample = criteria_monitor.observe(
+                        state,
+                        result.flight_path_angle_deg,
+                    )
+                    criteria_cutoff_reached = criteria_monitor.cutoff_reached
+                if (
+                    args.send
+                    and not touchdown_detected
+                    and not criteria_cutoff_reached
+                    and now >= next_send
+                ):
                     output = make_airborne_output(state, result)
                     sock.sendto(output.to_json_bytes(), latest_sender)
                     next_send = now + 1.0 / args.rate_hz
@@ -372,7 +420,20 @@ def main() -> int:
                     "speed_ki": controller.speed_pid.config.ki,
                     "speed_kd": controller.speed_pid.config.kd,
                     "speed_i_term": controller.speed_pid.config.ki * controller.speed_pid.integral,
+                    "criteria_course_error_deg": (
+                        criteria_sample.course_error_deg if criteria_sample else ""
+                    ),
+                    "criteria_glideslope_error_deg": (
+                        criteria_sample.glideslope_error_deg if criteria_sample else ""
+                    ),
+                    "criteria_status": criteria_sample.status if criteria_sample else "",
                 })
+                if criteria_cutoff_reached:
+                    print(
+                        "criteria cutoff reached at "
+                        f"ra={state.RadioAltitude:.1f}ft; stopping commands"
+                    )
+                    break
                 if now >= next_print:
                     print(
                         f"t={now-start:5.1f} ra={state.RadioAltitude:7.1f} ias={state.IndicatedAirspeed:6.1f} "
@@ -417,6 +478,13 @@ def main() -> int:
         if args.send:
             deactivate(sock, latest_sender, args.rate_hz)
         sock.close()
+        if criteria_monitor is not None:
+            verdict = criteria_monitor.verdict()
+            print(verdict.summary())
+            if exit_code == 0 and verdict.status == "FAIL":
+                exit_code = 9
+            elif exit_code == 0 and verdict.status == "INCOMPLETE":
+                exit_code = 10
         print(f"log={log_path}")
         if (
             dashboard_server is not None
